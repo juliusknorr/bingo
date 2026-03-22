@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bingo</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .card-cell {
+      aspect-ratio: 1;
+      cursor: pointer;
+      user-select: none;
+      transition: background-color 0.15s, transform 0.1s;
+    }
+    .card-cell:active { transform: scale(0.95); }
+    .card-cell.ticked {
+      background-color: #16a34a;
+      color: white;
+    }
+  </style>
+</head>
+<body class="bg-gray-100 min-h-screen font-sans" x-data="bingoApp()" x-cloak>
+
+  <!-- HOME -->
+  <div x-show="screen === 'home'" class="flex flex-col items-center justify-center min-h-screen p-4">
+    <div class="bg-white rounded-2xl shadow-lg p-8 w-full max-w-sm">
+      <h1 class="text-3xl font-bold text-center mb-6 text-green-700">Bingo!</h1>
+
+      <div class="mb-4">
+        <label class="block text-sm font-medium text-gray-700 mb-1">Dein Name</label>
+        <input
+          type="text"
+          x-model="playerName"
+          @keydown.enter="joinCode ? joinSession() : createSession()"
+          placeholder="Name eingeben…"
+          class="w-full border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-green-500"
+        />
+      </div>
+
+      <button
+        @click="createSession()"
+        :disabled="!playerName.trim()"
+        class="w-full bg-green-600 hover:bg-green-700 disabled:opacity-40 text-white font-semibold py-2 rounded-lg mb-3"
+      >
+        Neues Spiel erstellen
+      </button>
+
+      <div class="relative flex items-center my-4">
+        <div class="flex-1 border-t border-gray-300"></div>
+        <span class="mx-3 text-gray-400 text-sm">oder</span>
+        <div class="flex-1 border-t border-gray-300"></div>
+      </div>
+
+      <div class="mb-3">
+        <label class="block text-sm font-medium text-gray-700 mb-1">Spielcode</label>
+        <input
+          type="text"
+          x-model="joinCode"
+          @keydown.enter="joinSession()"
+          placeholder="z.B. AB12CD"
+          maxlength="6"
+          class="w-full border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-green-500 uppercase"
+        />
+      </div>
+
+      <button
+        @click="joinSession()"
+        :disabled="!playerName.trim() || !joinCode.trim()"
+        class="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white font-semibold py-2 rounded-lg"
+      >
+        Spiel beitreten
+      </button>
+
+      <p x-show="errorMsg" class="mt-4 text-red-600 text-sm text-center" x-text="errorMsg"></p>
+    </div>
+  </div>
+
+  <!-- LOBBY -->
+  <div x-show="screen === 'lobby'" class="flex flex-col items-center justify-center min-h-screen p-4">
+    <div class="bg-white rounded-2xl shadow-lg p-8 w-full max-w-sm">
+      <h1 class="text-3xl font-bold text-center mb-2 text-green-700">Warteraum</h1>
+
+      <div class="mb-4 text-center">
+        <p class="text-gray-500 text-sm mb-1">Spielcode</p>
+        <p class="text-2xl font-mono font-bold tracking-widest text-gray-800" x-text="sessionId"></p>
+      </div>
+
+      <div class="mb-4">
+        <button
+          @click="copyShareLink()"
+          class="w-full border border-gray-300 hover:bg-gray-50 text-gray-700 font-medium py-2 rounded-lg flex items-center justify-center gap-2"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+          <span x-text="linkCopied ? 'Link kopiert!' : 'Einladungslink kopieren'"></span>
+        </button>
+      </div>
+
+      <div class="mb-6">
+        <p class="text-sm font-medium text-gray-700 mb-2">Spieler (<span x-text="players.length"></span>)</p>
+        <ul class="space-y-1">
+          <template x-for="p in players" :key="p.id">
+            <li class="flex items-center gap-2 text-gray-800">
+              <span x-show="p.id === hostId" class="text-yellow-500 text-xs">&#9733;</span>
+              <span x-text="p.name"></span>
+              <span x-show="p.id === myId" class="text-xs text-gray-400">(du)</span>
+            </li>
+          </template>
+        </ul>
+      </div>
+
+      <button
+        x-show="isHost"
+        @click="startCollecting()"
+        class="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-2 rounded-lg"
+      >
+        Phrasen sammeln
+      </button>
+
+      <p x-show="!isHost" class="text-center text-gray-400 text-sm">Warte auf den Host…</p>
+    </div>
+  </div>
+
+  <!-- COLLECTING -->
+  <div x-show="screen === 'collecting'" class="flex flex-col min-h-screen p-4">
+    <div class="max-w-lg mx-auto w-full">
+      <div class="bg-white rounded-2xl shadow-lg p-6 mb-4">
+        <div class="flex items-center justify-between mb-4">
+          <h1 class="text-xl font-bold text-green-700">Phrasen sammeln</h1>
+          <span class="text-sm font-medium px-3 py-1 rounded-full"
+            :class="phrases.length >= 25 ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'"
+            x-text="phrases.length + ' / 25 Phrasen'"
+          ></span>
+        </div>
+
+        <div class="flex gap-2 mb-2">
+          <textarea
+            x-model="newPhrase"
+            @keydown.enter.ctrl="addPhrase()"
+            @keydown.enter.meta="addPhrase()"
+            placeholder="Neue Phrase… (mehrere Phrasen zeilenweise eingeben)"
+            rows="3"
+            class="flex-1 border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-green-500 resize-none"
+          ></textarea>
+          <button
+            @click="addPhrase()"
+            :disabled="!newPhrase.trim()"
+            class="bg-green-600 hover:bg-green-700 disabled:opacity-40 text-white font-semibold px-4 py-2 rounded-lg self-end"
+          >
+            +
+          </button>
+        </div>
+        <p class="text-xs text-gray-400">Doppelte Phrasen werden ignoriert. Strg+Enter zum Hinzufügen.</p>
+      </div>
+
+      <div class="bg-white rounded-2xl shadow-lg p-4 mb-4 max-h-96 overflow-y-auto">
+        <template x-if="phrases.length === 0">
+          <p class="text-gray-400 text-center py-4 text-sm">Noch keine Phrasen. Los geht's!</p>
+        </template>
+        <ul class="space-y-1">
+          <template x-for="(phrase, i) in phrases" :key="i">
+            <li class="flex items-center gap-2 py-1 border-b border-gray-50 last:border-0">
+              <span class="flex-1 text-gray-800 text-sm" x-text="phrase"></span>
+              <button
+                x-show="isHost"
+                @click="removePhrase(i)"
+                class="text-gray-300 hover:text-red-500 flex-shrink-0 text-lg leading-none"
+              >&times;</button>
+            </li>
+          </template>
+        </ul>
+      </div>
+
+      <button
+        x-show="isHost"
+        @click="startGame()"
+        :disabled="phrases.length < 25"
+        class="w-full bg-green-600 hover:bg-green-700 disabled:opacity-40 text-white font-semibold py-3 rounded-xl text-lg"
+      >
+        Spiel starten
+        <span x-show="phrases.length < 25" class="text-sm font-normal">
+          (noch <span x-text="25 - phrases.length"></span> fehlend)
+        </span>
+      </button>
+
+      <p x-show="!isHost" class="text-center text-gray-400 text-sm mt-4">Warte auf den Host zum Starten…</p>
+    </div>
+  </div>
+
+  <!-- PLAYING -->
+  <div x-show="screen === 'playing'" class="flex flex-col min-h-screen p-2">
+    <div class="max-w-lg mx-auto w-full">
+      <!-- Tabs -->
+      <div class="flex gap-1 mb-3 bg-gray-200 rounded-xl p-1">
+        <button
+          @click="activeTab = 'mycard'"
+          :class="activeTab === 'mycard' ? 'bg-white shadow text-green-700 font-semibold' : 'text-gray-500'"
+          class="flex-1 py-2 rounded-lg text-sm transition-all"
+        >
+          Meine Karte
+        </button>
+        <button
+          @click="activeTab = 'others'"
+          :class="activeTab === 'others' ? 'bg-white shadow text-green-700 font-semibold' : 'text-gray-500'"
+          class="flex-1 py-2 rounded-lg text-sm transition-all"
+        >
+          Andere (<span x-text="otherPlayers.length"></span>)
+        </button>
+      </div>
+
+      <!-- My Card -->
+      <div x-show="activeTab === 'mycard'">
+        <div class="grid grid-cols-5 gap-1">
+          <template x-for="(cell, i) in myCard" :key="i">
+            <div
+              @click="tickField(i)"
+              class="card-cell rounded-lg flex items-center justify-center text-center p-1 border-2"
+              :class="myTicked.has(i) ? 'ticked border-green-700' : 'bg-white border-gray-200 text-gray-800 hover:border-green-400'"
+            >
+              <span class="text-xs leading-tight" style="font-size: clamp(0.55rem, 1.8vw, 0.75rem)" x-text="cell"></span>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Others' Progress -->
+      <div x-show="activeTab === 'others'" class="space-y-4">
+        <template x-if="otherPlayers.length === 0">
+          <p class="text-gray-400 text-center py-8">Keine anderen Spieler.</p>
+        </template>
+        <template x-for="p in otherPlayers" :key="p.id">
+          <div class="bg-white rounded-xl shadow p-4">
+            <div class="flex items-center gap-2 mb-2">
+              <span class="font-semibold text-gray-800" x-text="p.name"></span>
+              <span x-show="p.bingo" class="bg-green-100 text-green-700 text-xs px-2 py-0.5 rounded-full font-bold">BINGO!</span>
+              <span class="ml-auto text-xs text-gray-400" x-text="(playerTicked[p.id]?.size || 0) + ' angekreuzt'"></span>
+            </div>
+            <!-- Mini progress grid -->
+            <div class="grid grid-cols-5 gap-0.5">
+              <template x-for="j in 25" :key="j">
+                <div
+                  class="rounded aspect-square"
+                  :class="playerTicked[p.id]?.has(j-1) ? 'bg-green-500' : 'bg-gray-100'"
+                ></div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>
+
+  <!-- FINISHED -->
+  <div x-show="screen === 'finished'" class="flex flex-col items-center justify-center min-h-screen p-4">
+    <div class="bg-white rounded-2xl shadow-lg p-8 w-full max-w-sm text-center">
+      <div class="text-6xl mb-4">🎉</div>
+      <h1 class="text-2xl font-bold text-green-700 mb-2">Bingo!</h1>
+      <p class="text-gray-600 mb-1">Gewinner:</p>
+      <p class="text-2xl font-bold text-gray-800 mb-6" x-text="winnerName"></p>
+
+      <button
+        x-show="isHost"
+        @click="restartGame()"
+        class="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-3 rounded-xl text-lg"
+      >
+        Neues Spiel
+      </button>
+      <p x-show="!isHost" class="text-gray-400 text-sm">Warte auf den Host…</p>
+    </div>
+  </div>
+
+  <script>
+    function bingoApp() {
+      return {
+        socket: null,
+        screen: 'home',
+        playerName: '',
+        joinCode: '',
+        errorMsg: '',
+        linkCopied: false,
+
+        // Session state
+        sessionId: null,
+        myId: null,
+        isHost: false,
+        hostId: null,
+        players: [],
+        phrases: [],
+        winnerName: '',
+        newPhrase: '',
+
+        // Playing state
+        myCard: [],
+        myTicked: new Set(),
+        playerTicked: {}, // playerId -> Set<index>
+        activeTab: 'mycard',
+
+        get otherPlayers() {
+          return this.players.filter(p => p.id !== this.myId);
+        },
+
+        init() {
+          this.socket = io();
+          this.setupSocketListeners();
+
+          // Pre-fill name from last visit
+          const savedName = localStorage.getItem('bingoName');
+          if (savedName) this.playerName = savedName;
+
+          // Determine session to join: URL path takes priority, then localStorage
+          const pathMatch = window.location.pathname.match(/^\/join\/([A-Z0-9]{6})$/i);
+          const urlSessionId = pathMatch ? pathMatch[1].toUpperCase() : null;
+          const storedSessionId = localStorage.getItem('bingoSessionId');
+          const targetSessionId = urlSessionId || storedSessionId;
+
+          if (targetSessionId) {
+            this.joinCode = targetSessionId;
+            if (!urlSessionId) {
+              history.replaceState({}, '', '/join/' + targetSessionId);
+            }
+            if (savedName) {
+              this.$nextTick(() => this.joinSession());
+            }
+          }
+        },
+
+        setupSocketListeners() {
+          const s = this.socket;
+
+          s.on('session_joined', (data) => {
+            this.sessionId = data.sessionId;
+            this.myId = data.playerId;
+            this.isHost = data.isHost;
+            this.hostId = data.isHost ? data.playerId : this.hostId;
+            this.players = data.players;
+            this.phrases = data.phrases;
+            localStorage.setItem('bingoName', this.playerName);
+            localStorage.setItem('bingoSessionId', data.sessionId);
+
+            const phaseScreen = { LOBBY: 'lobby', COLLECTING: 'collecting', PLAYING: 'playing', FINISHED: 'finished' };
+            this.screen = phaseScreen[data.phase] || 'lobby';
+            this.errorMsg = '';
+
+            if (data.isHost) this.hostId = data.playerId;
+
+            // Reflect session in URL so reload restores state
+            const target = '/join/' + data.sessionId;
+            if (window.location.pathname !== target) {
+              history.pushState({}, '', target);
+            }
+          });
+
+          s.on('error', (data) => {
+            this.errorMsg = data.message;
+            // If auto-join from URL failed, return to home and clear URL + stored session
+            if (this.screen === 'home') {
+              history.replaceState({}, '', '/');
+              localStorage.removeItem('bingoSessionId');
+            }
+          });
+
+          s.on('player_joined', (data) => {
+            if (!this.players.find(p => p.id === data.player.id)) {
+              this.players.push(data.player);
+            }
+          });
+
+          s.on('player_left', (data) => {
+            this.players = this.players.filter(p => p.id !== data.playerId);
+            delete this.playerTicked[data.playerId];
+          });
+
+          s.on('phase_changed', (data) => {
+            const phaseScreen = { LOBBY: 'lobby', COLLECTING: 'collecting', PLAYING: 'playing', FINISHED: 'finished' };
+            this.screen = phaseScreen[data.phase] || this.screen;
+
+            if (data.phase === 'COLLECTING') {
+              this.myCard = [];
+              this.myTicked = new Set();
+              this.playerTicked = {};
+              this.winnerName = '';
+              this.newPhrase = '';
+            }
+          });
+
+          s.on('phrases_updated', (data) => {
+            this.phrases = data.phrases;
+          });
+
+          s.on('game_started', (data) => {
+            this.screen = 'playing';
+            this.myCard = data.cards[this.myId] || [];
+            this.myTicked = new Set();
+            this.playerTicked = {};
+            for (const [pid] of Object.entries(data.cards)) {
+              this.playerTicked[pid] = new Set();
+            }
+          });
+
+          s.on('field_ticked', (data) => {
+            if (data.playerId === this.myId) {
+              if (data.ticked) this.myTicked.add(data.index);
+              else this.myTicked.delete(data.index);
+              this.myTicked = new Set(this.myTicked); // trigger reactivity
+            } else {
+              if (!this.playerTicked[data.playerId]) {
+                this.playerTicked[data.playerId] = new Set();
+              }
+              if (data.ticked) this.playerTicked[data.playerId].add(data.index);
+              else this.playerTicked[data.playerId].delete(data.index);
+              this.playerTicked = { ...this.playerTicked }; // trigger reactivity
+            }
+          });
+
+          s.on('bingo', (data) => {
+            this.winnerName = data.winnerName;
+            // Update bingo flag on player
+            const p = this.players.find(p => p.id === data.winnerId);
+            if (p) p.bingo = true;
+            this.screen = 'finished';
+          });
+
+          s.on('host_changed', (data) => {
+            this.hostId = data.newHostId;
+            this.isHost = this.myId === data.newHostId;
+          });
+        },
+
+        createSession() {
+          if (!this.playerName.trim()) return;
+          this.errorMsg = '';
+          this.socket.emit('create_session', { playerName: this.playerName.trim() });
+        },
+
+        joinSession() {
+          if (!this.playerName.trim() || !this.joinCode.trim()) return;
+          this.errorMsg = '';
+          this.socket.emit('join_session', {
+            sessionId: this.joinCode.trim().toUpperCase(),
+            playerName: this.playerName.trim(),
+          });
+        },
+
+        copyShareLink() {
+          const url = window.location.origin + '/join/' + this.sessionId;
+          navigator.clipboard.writeText(url).then(() => {
+            this.linkCopied = true;
+            setTimeout(() => { this.linkCopied = false; }, 2000);
+          });
+        },
+
+        startCollecting() {
+          this.socket.emit('start_collecting', {});
+        },
+
+        addPhrase() {
+          const lines = this.newPhrase.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+          if (lines.length === 0) return;
+          for (const phrase of lines) {
+            this.socket.emit('add_phrase', { phrase });
+          }
+          this.newPhrase = '';
+        },
+
+        removePhrase(i) {
+          this.socket.emit('remove_phrase', { phraseIndex: i });
+        },
+
+        startGame() {
+          this.socket.emit('start_game', {});
+        },
+
+        tickField(i) {
+          this.socket.emit('tick_field', { index: i });
+        },
+
+        restartGame() {
+          this.socket.emit('restart_game', {});
+        },
+      };
+    }
+  </script>
+</body>
+</html>
