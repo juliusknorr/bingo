@@ -306,7 +306,8 @@
 
         // Session state
         sessionId: null,
-        myId: null,
+        myId: null,   // stable pid from localStorage
+        myPid: null,  // same reference, kept for clarity
         isHost: false,
         hostId: null,
         players: [],
@@ -317,8 +318,8 @@
         // Playing state
         myCard: [],
         myTicked: new Set(),
-        playerTicked: {}, // playerId -> Set<index>
-        allCards: {}, // playerId -> card array (all players)
+        playerTicked: {}, // pid -> Set<index>
+        allCards: {}, // pid -> card array (all players)
         activeTab: 'mycard',
 
         get otherPlayers() {
@@ -328,6 +329,15 @@
         init() {
           this.socket = io();
           this.setupSocketListeners();
+
+          // Stable persistent player id — survives page reloads and server restarts
+          let pid = localStorage.getItem('bingoPid');
+          if (!pid) {
+            pid = 'p' + Math.random().toString(36).substring(2, 18);
+            localStorage.setItem('bingoPid', pid);
+          }
+          this.myPid = pid;
+          this.myId = pid;
 
           // Pre-fill name from last visit
           const savedName = localStorage.getItem('bingoName');
@@ -355,9 +365,9 @@
 
           s.on('session_joined', (data) => {
             this.sessionId = data.sessionId;
-            this.myId = data.playerId;
+            this.myId = data.playerId;  // stable pid from server
             this.isHost = data.isHost;
-            this.hostId = data.isHost ? data.playerId : this.hostId;
+            this.hostId = data.hostId;
             this.players = data.players;
             this.phrases = data.phrases;
             localStorage.setItem('bingoName', this.playerName);
@@ -367,7 +377,22 @@
             this.screen = phaseScreen[data.phase] || 'lobby';
             this.errorMsg = '';
 
-            if (data.isHost) this.hostId = data.playerId;
+            // Restore game state when reconnecting mid-game (e.g. after server restart)
+            if (data.cards) {
+              this.allCards = data.cards;
+              this.myCard = data.cards[this.myId] || [];
+              this.myTicked = new Set(data.ticked?.[this.myId] || []);
+              this.playerTicked = {};
+              for (const [pid, indices] of Object.entries(data.ticked || {})) {
+                this.playerTicked[pid] = new Set(indices);
+              }
+            } else {
+              this.myCard = [];
+              this.allCards = {};
+              this.myTicked = new Set();
+              this.playerTicked = {};
+            }
+            this.winnerName = data.winnerName || '';
 
             // Reflect session in URL so reload restores state
             const target = '/join/' + data.sessionId;
@@ -416,11 +441,11 @@
 
           s.on('game_started', (data) => {
             this.screen = 'playing';
-            this.myCard = data.cards[this.myId] || [];
             this.allCards = data.cards;
+            this.myCard = data.cards[this.myId] || [];
             this.myTicked = new Set();
             this.playerTicked = {};
-            for (const [pid] of Object.entries(data.cards)) {
+            for (const pid of Object.keys(data.cards)) {
               this.playerTicked[pid] = new Set();
             }
           });
@@ -457,7 +482,7 @@
         createSession() {
           if (!this.playerName.trim()) return;
           this.errorMsg = '';
-          this.socket.emit('create_session', { playerName: this.playerName.trim() });
+          this.socket.emit('create_session', { playerName: this.playerName.trim(), pid: this.myPid });
         },
 
         joinSession() {
@@ -466,6 +491,7 @@
           this.socket.emit('join_session', {
             sessionId: this.joinCode.trim().toUpperCase(),
             playerName: this.playerName.trim(),
+            pid: this.myPid,
           });
         },
 

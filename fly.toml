@@ -8,6 +8,9 @@ primary_region = 'fra'
 
 [build]
 
+[env]
+  DATA_DIR = "/data"
+
 [http_service]
   internal_port = 3000
   force_https = true
@@ -15,6 +18,10 @@ primary_region = 'fra'
   auto_start_machines = true
   min_machines_running = 0
   processes = ['app']
+
+[[mounts]]
+  source = "bingo_data"
+  destination = "/data"
 
 [[vm]]
   memory = '1gb'

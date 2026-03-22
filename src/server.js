@@ -3,6 +3,7 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -11,9 +12,78 @@ const io = new Server(httpServer);
 
 const PORT = process.env.PORT || 3000;
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const DATA_DIR = process.env.DATA_DIR || join(__dirname, '..', 'data');
+const SESSIONS_FILE = join(DATA_DIR, 'sessions.json');
 
-// In-memory session store
-const sessions = new Map();
+// --- Persistence ---
+
+function saveSessions() {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    const obj = {};
+    for (const [id, s] of sessions) {
+      obj[id] = {
+        id: s.id,
+        hostId: s.hostId,
+        phase: s.phase,
+        phrases: s.phrases,
+        winner: s.winner,
+        lastActivity: s.lastActivity.toISOString(),
+        players: [...s.players.entries()].map(([pid, p]) => ({
+          pid,
+          name: p.name,
+          card: p.card,
+          ticked: [...p.ticked],
+          bingo: p.bingo,
+        })),
+      };
+    }
+    writeFileSync(SESSIONS_FILE, JSON.stringify(obj));
+  } catch (e) {
+    console.error('Failed to save sessions:', e);
+  }
+}
+
+function loadSessions() {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    const raw = readFileSync(SESSIONS_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    const map = new Map();
+    for (const [id, s] of Object.entries(obj)) {
+      const players = new Map();
+      for (const p of s.players) {
+        players.set(p.pid, {
+          pid: p.pid,
+          name: p.name,
+          card: p.card,
+          ticked: new Set(p.ticked),
+          bingo: p.bingo,
+          socketId: null,
+        });
+      }
+      map.set(id, {
+        id: s.id,
+        hostId: s.hostId,
+        phase: s.phase,
+        phrases: s.phrases,
+        winner: s.winner,
+        lastActivity: new Date(s.lastActivity),
+        players,
+        pidToSocket: new Map(), // ephemeral: pid -> socketId
+      });
+    }
+    console.log(`Loaded ${map.size} session(s) from disk`);
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+// In-memory session store (pre-loaded from disk)
+const sessions = loadSessions();
+
+// --- Helpers ---
 
 function generateId(len = 6) {
   return Math.random().toString(36).substring(2, 2 + len).toUpperCase();
@@ -41,38 +111,16 @@ function generateCard(phrases) {
 }
 
 function checkBingo(ticked) {
-  // ticked is a Set of indices 0-24, grid is 5x5
   const t = (i) => ticked.has(i);
-
-  // Rows
   for (let r = 0; r < 5; r++) {
     if ([0,1,2,3,4].every(c => t(r * 5 + c))) return true;
   }
-  // Columns
   for (let c = 0; c < 5; c++) {
     if ([0,1,2,3,4].every(r => t(r * 5 + c))) return true;
   }
-  // Diagonals
   if ([0,6,12,18,24].every(i => t(i))) return true;
   if ([4,8,12,16,20].every(i => t(i))) return true;
-
   return false;
-}
-
-function sessionToPublic(session) {
-  return {
-    id: session.id,
-    phase: session.phase,
-    hostId: session.hostId,
-    players: [...session.players.entries()].map(([id, p]) => ({
-      id,
-      name: p.name,
-      bingo: p.bingo,
-      tickedCount: p.ticked.size,
-    })),
-    phrases: session.phrases,
-    winner: session.winner,
-  };
 }
 
 function getSession(sessionId) {
@@ -81,93 +129,129 @@ function getSession(sessionId) {
   return s;
 }
 
+function playersToPublic(session) {
+  return [...session.players.entries()].map(([pid, p]) => ({
+    id: pid,
+    name: p.name,
+    bingo: p.bingo,
+    tickedCount: p.ticked.size,
+  }));
+}
+
 function promoteHost(session) {
-  const next = session.players.keys().next().value;
-  if (next) {
-    session.hostId = next;
-    io.to(session.id).emit('host_changed', { newHostId: next });
+  const nextPid = [...session.players.entries()]
+    .find(([pid, p]) => p.socketId !== null)?.[0];
+  if (nextPid) {
+    session.hostId = nextPid;
+    io.to(session.id).emit('host_changed', { newHostId: nextPid });
+    saveSessions();
   }
 }
 
-// Serve static files
+// --- Routes ---
+
 app.use(express.static(join(__dirname, 'public')));
 
-// Deep-link route: /join/:sessionId
 app.get('/join/:sessionId', (req, res) => {
   res.sendFile(join(__dirname, 'public', 'index.html'));
 });
 
-// Socket.io
+// --- Socket.io ---
+
 io.on('connection', (socket) => {
   let currentSessionId = null;
+  let myPid = null;
 
-  socket.on('create_session', ({ playerName }) => {
+  socket.on('create_session', ({ playerName, pid }) => {
+    myPid = pid;
     const sessionId = generateId();
+    const name = playerName?.trim() || 'Spieler';
+    const player = { pid, name, card: null, ticked: new Set(), bingo: false, socketId: socket.id };
     const session = {
       id: sessionId,
-      hostId: socket.id,
+      hostId: pid,
       phase: 'LOBBY',
-      players: new Map(),
+      players: new Map([[pid, player]]),
       phrases: [],
       winner: null,
       lastActivity: new Date(),
+      pidToSocket: new Map([[pid, socket.id]]),
     };
-    const name = playerName?.trim() || 'Spieler';
-    session.players.set(socket.id, {
-      id: socket.id,
-      name,
-      card: null,
-      ticked: new Set(),
-      bingo: false,
-    });
     sessions.set(sessionId, session);
     currentSessionId = sessionId;
     socket.join(sessionId);
+    saveSessions();
 
     socket.emit('session_joined', {
       sessionId,
-      playerId: socket.id,
+      playerId: pid,
+      hostId: session.hostId,
       isHost: true,
       phase: session.phase,
-      players: [...session.players.entries()].map(([id, p]) => ({ id, name: p.name, bingo: p.bingo })),
-      phrases: session.phrases,
+      players: playersToPublic(session),
+      phrases: [],
     });
   });
 
-  socket.on('join_session', ({ sessionId, playerName }) => {
+  socket.on('join_session', ({ sessionId, playerName, pid }) => {
+    myPid = pid;
     const session = getSession(sessionId?.toUpperCase());
     if (!session) {
       socket.emit('error', { message: 'Sitzung nicht gefunden.' });
       return;
     }
-    if (session.phase === 'FINISHED') {
-      socket.emit('error', { message: 'Dieses Spiel ist bereits beendet.' });
-      return;
+
+    let player = session.players.get(pid);
+    if (player) {
+      // Reconnect: restore this socket to the existing player
+      player.socketId = socket.id;
+      // Tell other clients this player is back (they removed them on disconnect)
+      socket.to(session.id).emit('player_joined', {
+        player: { id: pid, name: player.name, bingo: player.bingo },
+      });
+    } else {
+      // New player joining
+      if (session.phase === 'FINISHED') {
+        socket.emit('error', { message: 'Dieses Spiel ist bereits beendet.' });
+        return;
+      }
+      const name = uniqueName(playerName?.trim() || 'Spieler', session.players);
+      const card = session.phase === 'PLAYING' ? generateCard(session.phrases) : null;
+      player = { pid, name, card, ticked: new Set(), bingo: false, socketId: socket.id };
+      session.players.set(pid, player);
+      saveSessions();
+      socket.to(session.id).emit('player_joined', {
+        player: { id: pid, name, bingo: false },
+      });
     }
 
-    const name = uniqueName(playerName?.trim() || 'Spieler', session.players);
-    session.players.set(socket.id, {
-      id: socket.id,
-      name,
-      card: null,
-      ticked: new Set(),
-      bingo: false,
-    });
+    session.pidToSocket.set(pid, socket.id);
     currentSessionId = session.id;
     socket.join(session.id);
 
-    socket.emit('session_joined', {
+    const response = {
       sessionId: session.id,
-      playerId: socket.id,
-      isHost: session.hostId === socket.id,
+      playerId: pid,
+      hostId: session.hostId,
+      isHost: session.hostId === pid,
       phase: session.phase,
-      players: [...session.players.entries()].map(([id, p]) => ({ id, name: p.name, bingo: p.bingo })),
+      players: playersToPublic(session),
       phrases: session.phrases,
-    });
+    };
 
-    socket.to(session.id).emit('player_joined', {
-      player: { id: socket.id, name, bingo: false },
-    });
+    // Include full game state so the client can restore after a reconnect
+    if (session.phase === 'PLAYING' || session.phase === 'FINISHED') {
+      response.cards = Object.fromEntries(
+        [...session.players.entries()].map(([p, pl]) => [p, pl.card])
+      );
+      response.ticked = Object.fromEntries(
+        [...session.players.entries()].map(([p, pl]) => [p, [...pl.ticked]])
+      );
+      response.winner = session.winner;
+      response.winnerName = session.players.get(session.winner)?.name || '';
+    }
+
+    socket.emit('session_joined', response);
   });
 
   socket.on('add_phrase', ({ phrase }) => {
@@ -177,74 +261,77 @@ io.on('connection', (socket) => {
     if (!p || session.phrases.includes(p)) return;
     session.phrases.push(p);
     io.to(session.id).emit('phrases_updated', { phrases: session.phrases });
+    saveSessions();
   });
 
   socket.on('remove_phrase', ({ phraseIndex }) => {
     const session = getSession(currentSessionId);
     if (!session || session.phase !== 'COLLECTING') return;
-    if (session.hostId !== socket.id) return;
+    if (session.hostId !== myPid) return;
     if (phraseIndex < 0 || phraseIndex >= session.phrases.length) return;
     session.phrases.splice(phraseIndex, 1);
     io.to(session.id).emit('phrases_updated', { phrases: session.phrases });
+    saveSessions();
   });
 
   socket.on('start_collecting', () => {
     const session = getSession(currentSessionId);
-    if (!session || session.hostId !== socket.id) return;
+    if (!session || session.hostId !== myPid) return;
     if (session.phase !== 'LOBBY') return;
     session.phase = 'COLLECTING';
     io.to(session.id).emit('phase_changed', { phase: 'COLLECTING' });
+    saveSessions();
   });
 
   socket.on('start_game', () => {
     const session = getSession(currentSessionId);
-    if (!session || session.hostId !== socket.id) return;
+    if (!session || session.hostId !== myPid) return;
     if (session.phase !== 'COLLECTING') return;
     if (session.phrases.length < 25) return;
 
     session.phase = 'PLAYING';
-
-    // Generate a card per player
     const cards = {};
-    for (const [id, player] of session.players) {
+    for (const [pid, player] of session.players) {
       player.card = generateCard(session.phrases);
       player.ticked = new Set();
       player.bingo = false;
-      cards[id] = player.card;
+      cards[pid] = player.card;
     }
     session.winner = null;
+    saveSessions();
 
     io.to(session.id).emit('phase_changed', { phase: 'PLAYING' });
-    // Send each player their own card (and all others for spectator view)
     io.to(session.id).emit('game_started', { cards });
   });
 
   socket.on('tick_field', ({ index }) => {
     const session = getSession(currentSessionId);
     if (!session || session.phase !== 'PLAYING') return;
-    const player = session.players.get(socket.id);
+    const player = session.players.get(myPid);
     if (!player) return;
     if (index < 0 || index > 24) return;
 
-    const ticked = player.ticked.has(index);
-    if (ticked) {
+    const wasTicked = player.ticked.has(index);
+    if (wasTicked) {
       player.ticked.delete(index);
     } else {
       player.ticked.add(index);
     }
+    saveSessions();
 
     io.to(session.id).emit('field_ticked', {
-      playerId: socket.id,
+      playerId: myPid,
       index,
-      ticked: !ticked,
+      ticked: !wasTicked,
     });
 
-    if (!ticked && checkBingo(player.ticked) && !player.bingo) {
+    if (!wasTicked && checkBingo(player.ticked) && !player.bingo) {
       player.bingo = true;
-      session.winner = socket.id;
+      session.winner = myPid;
       session.phase = 'FINISHED';
+      saveSessions();
       io.to(session.id).emit('bingo', {
-        winnerId: socket.id,
+        winnerId: myPid,
         winnerName: player.name,
       });
     }
@@ -252,7 +339,7 @@ io.on('connection', (socket) => {
 
   socket.on('restart_game', () => {
     const session = getSession(currentSessionId);
-    if (!session || session.hostId !== socket.id) return;
+    if (!session || session.hostId !== myPid) return;
 
     session.phase = 'COLLECTING';
     session.phrases = [];
@@ -262,25 +349,24 @@ io.on('connection', (socket) => {
       player.ticked = new Set();
       player.bingo = false;
     }
+    saveSessions();
 
     io.to(session.id).emit('phase_changed', { phase: 'COLLECTING' });
     io.to(session.id).emit('phrases_updated', { phrases: [] });
   });
 
   socket.on('disconnect', () => {
-    if (!currentSessionId) return;
+    if (!currentSessionId || !myPid) return;
     const session = sessions.get(currentSessionId);
     if (!session) return;
 
-    session.players.delete(socket.id);
-    io.to(session.id).emit('player_left', { playerId: socket.id });
+    const player = session.players.get(myPid);
+    if (player) player.socketId = null;
+    session.pidToSocket.delete(myPid);
 
-    if (session.players.size === 0) {
-      sessions.delete(session.id);
-      return;
-    }
+    io.to(session.id).emit('player_left', { playerId: myPid });
 
-    if (session.hostId === socket.id) {
+    if (session.hostId === myPid) {
       promoteHost(session);
     }
   });
@@ -294,6 +380,7 @@ setInterval(() => {
       sessions.delete(id);
     }
   }
+  saveSessions();
 }, 5 * 60 * 1000);
 
 httpServer.listen(PORT, () => {
