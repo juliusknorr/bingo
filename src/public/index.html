@@ -253,12 +253,35 @@
   </div>
 
   <!-- FINISHED -->
-  <div x-show="screen === 'finished'" class="flex flex-col items-center justify-center min-h-screen p-4">
-    <div class="bg-white rounded-2xl shadow-lg p-8 w-full max-w-sm text-center">
-      <div class="text-6xl mb-4">🎉</div>
-      <h1 class="text-2xl font-bold text-green-700 mb-2">Bingo!</h1>
-      <p class="text-gray-600 mb-1">Gewinner:</p>
-      <p class="text-2xl font-bold text-gray-800 mb-6" x-text="winnerName"></p>
+  <div x-show="screen === 'finished'" class="flex flex-col min-h-screen p-4">
+    <div class="max-w-2xl mx-auto w-full">
+      <div class="text-center mb-6">
+        <div class="text-5xl mb-2">🎉</div>
+        <h1 class="text-2xl font-bold text-green-700">Bingo!</h1>
+        <p class="text-gray-600">Gewinner: <span class="font-bold text-gray-800" x-text="winnerName"></span></p>
+      </div>
+
+      <div class="space-y-6 mb-6">
+        <template x-for="p in players" :key="p.id">
+          <div class="bg-white rounded-2xl shadow-lg p-4">
+            <div class="flex items-center gap-2 mb-3">
+              <span class="font-bold text-gray-800 text-lg" x-text="p.name"></span>
+              <span x-show="p.id === myId" class="text-xs text-gray-400">(du)</span>
+              <span x-show="p.bingo" class="bg-green-100 text-green-700 text-xs px-2 py-0.5 rounded-full font-bold">BINGO!</span>
+            </div>
+            <div class="grid grid-cols-5 gap-1">
+              <template x-for="(cell, i) in (allCards[p.id] || [])" :key="i">
+                <div
+                  class="rounded-lg flex items-center justify-center text-center p-1 border-2 aspect-square"
+                  :class="isTickedFor(p.id, i) ? 'bg-green-500 border-green-700 text-white' : 'bg-gray-50 border-gray-200 text-gray-800'"
+                >
+                  <span class="leading-tight" style="font-size: clamp(0.45rem, 1.5vw, 0.65rem)" x-text="cell"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
 
       <button
         x-show="isHost"
@@ -267,7 +290,7 @@
       >
         Neues Spiel
       </button>
-      <p x-show="!isHost" class="text-gray-400 text-sm">Warte auf den Host…</p>
+      <p x-show="!isHost" class="text-center text-gray-400 text-sm">Warte auf den Host…</p>
     </div>
   </div>
 
@@ -295,6 +318,7 @@
         myCard: [],
         myTicked: new Set(),
         playerTicked: {}, // playerId -> Set<index>
+        allCards: {}, // playerId -> card array (all players)
         activeTab: 'mycard',
 
         get otherPlayers() {
@@ -378,6 +402,7 @@
 
             if (data.phase === 'COLLECTING') {
               this.myCard = [];
+              this.allCards = {};
               this.myTicked = new Set();
               this.playerTicked = {};
               this.winnerName = '';
@@ -392,6 +417,7 @@
           s.on('game_started', (data) => {
             this.screen = 'playing';
             this.myCard = data.cards[this.myId] || [];
+            this.allCards = data.cards;
             this.myTicked = new Set();
             this.playerTicked = {};
             for (const [pid] of Object.entries(data.cards)) {
@@ -478,6 +504,11 @@
 
         restartGame() {
           this.socket.emit('restart_game', {});
+        },
+
+        isTickedFor(playerId, index) {
+          const ticked = playerId === this.myId ? this.myTicked : (this.playerTicked[playerId] || new Set());
+          return ticked.has(index);
         },
       };
     }
